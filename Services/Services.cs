@@ -313,8 +313,10 @@ public class MedicineService(AppDbContext db) : IMedicineService
     public async Task<List<MedicineDto>> SearchAsync(string? name, string? category)
     {
         var query = db.Medicines.AsQueryable();
-        if (!string.IsNullOrWhiteSpace(name)) query = query.Where(x => x.Name.ToLower().Contains(name.ToLower()));
-        if (!string.IsNullOrWhiteSpace(category)) query = query.Where(x => x.Category != null && x.Category.ToLower().Contains(category.ToLower()));
+        if (!string.IsNullOrWhiteSpace(name))
+            query = query.Where(x => EF.Functions.ILike(x.Name, PostgresSearchPatterns.ContainsPattern(name)));
+        if (!string.IsNullOrWhiteSpace(category))
+            query = query.Where(x => x.Category != null && EF.Functions.ILike(x.Category, PostgresSearchPatterns.ContainsPattern(category)));
         var data = await query.ToListAsync();
         return data.Select(ToDto).ToList();
     }
@@ -351,7 +353,11 @@ public class MedicineService(AppDbContext db) : IMedicineService
 public interface ISearchService
 {
     Task<List<SearchResultDto>> SearchAsync(string medicineName, double lat, double lng);
-    Task<List<SearchResultDto>> SearchForMedicinesAsync(IEnumerable<string> medicineNames, double lat, double lng);
+    Task<List<SearchResultDto>> SearchForMedicinesAsync(
+        IEnumerable<string> medicineNames,
+        double lat,
+        double lng,
+        CancellationToken cancellationToken = default);
 }
 
 public class SearchService(AppDbContext db) : ISearchService
@@ -361,37 +367,41 @@ public class SearchService(AppDbContext db) : ISearchService
         if (string.IsNullOrWhiteSpace(medicineName))
             throw ApiException.BadRequest(ApiErrorCodes.SearchInvalidQuery, "Medicine name is required.");
 
-        var rows = await db.PharmacyMedicines
-            .Include(pm => pm.Pharmacy)
-            .Include(pm => pm.Medicine)
-            .Where(pm => pm.Quantity > 0
-                         && pm.Pharmacy!.Status == PharmacyStatus.Approved
-                         && pm.Medicine!.Name.ToLower().Contains(medicineName.ToLower()))
-            .ToListAsync();
-
+        var rows = await QueryPharmacyMedicinesAsync([medicineName], CancellationToken.None);
         return MapAndSortByDistance(rows, lat, lng);
     }
 
     public async Task<List<SearchResultDto>> SearchForMedicinesAsync(
-        IEnumerable<string> medicineNames, double lat, double lng)
+        IEnumerable<string> medicineNames,
+        double lat,
+        double lng,
+        CancellationToken cancellationToken = default)
     {
-        var seen = new HashSet<(Guid PharmacyId, Guid MedicineId)>();
-        var merged = new List<SearchResultDto>();
+        var names = medicineNames
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-        foreach (var name in medicineNames
-                     .Where(n => !string.IsNullOrWhiteSpace(n))
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            var batch = await SearchAsync(name, lat, lng);
-            foreach (var result in batch)
-            {
-                var key = (result.PharmacyId, result.MedicineId);
-                if (seen.Add(key))
-                    merged.Add(result);
-            }
-        }
+        if (names.Count == 0)
+            return [];
 
-        return merged.OrderBy(x => x.Distance).ToList();
+        var rows = await QueryPharmacyMedicinesAsync(names, cancellationToken);
+        return MapAndSortByDistance(rows, lat, lng);
+    }
+
+    private async Task<List<PharmacyMedicine>> QueryPharmacyMedicinesAsync(
+        IReadOnlyList<string> medicineNames,
+        CancellationToken cancellationToken)
+    {
+        var patterns = medicineNames.Select(PostgresSearchPatterns.ContainsPattern).ToList();
+
+        return await db.PharmacyMedicines
+            .Include(pm => pm.Pharmacy)
+            .Include(pm => pm.Medicine)
+            .Where(pm => pm.Quantity > 0
+                         && pm.Pharmacy!.Status == PharmacyStatus.Approved
+                         && patterns.Any(pattern => EF.Functions.ILike(pm.Medicine!.Name, pattern)))
+            .ToListAsync(cancellationToken);
     }
 
     private static List<SearchResultDto> MapAndSortByDistance(
@@ -518,17 +528,17 @@ public class PrescriptionService(
         }
         catch (ApiException)
         {
-            await MarkPrescriptionFailedAsync(prescription.Id, cancellationToken);
+            await MarkPrescriptionFailedAsync(prescription.Id);
             throw;
         }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
-            await MarkPrescriptionFailedAsync(prescription.Id, cancellationToken);
+            await MarkPrescriptionFailedAsync(prescription.Id);
             throw ApiException.BadRequest(ApiErrorCodes.PrescriptionOcrFailed, ex.Message);
         }
         catch (Exception ex)
         {
-            await MarkPrescriptionFailedAsync(prescription.Id, cancellationToken);
+            await MarkPrescriptionFailedAsync(prescription.Id);
             throw ApiException.BadRequest(ApiErrorCodes.PrescriptionOcrFailed,
                 TesseractOcrService.GetRootCauseMessage(ex));
         }
@@ -555,26 +565,23 @@ public class PrescriptionService(
             throw ApiException.BadRequest(ApiErrorCodes.PrescriptionNoMedicines,
                 "At least one medicine with a catalogue match is required to search.");
 
-        if (prescription.Status != PrescriptionStatus.Ready)
+        await db.PrescriptionItems
+            .Where(pi => pi.PrescriptionId == prescriptionId)
+            .ExecuteDeleteAsync(cancellationToken);
+
+        foreach (var i in confirmedWithMedicine)
         {
-            await db.PrescriptionItems
-                .Where(pi => pi.PrescriptionId == prescriptionId)
-                .ExecuteDeleteAsync(cancellationToken);
-
-            foreach (var i in confirmedWithMedicine)
+            db.PrescriptionItems.Add(new PrescriptionItem
             {
-                db.PrescriptionItems.Add(new PrescriptionItem
-                {
-                    PrescriptionId = prescription.Id,
-                    MedicineId = i.MedicineId,
-                    MedicineNameRaw = i.MedicineNameRaw,
-                    Quantity = i.Quantity
-                });
-            }
-
-            prescription.Status = PrescriptionStatus.Ready;
-            await db.SaveChangesAsync(cancellationToken);
+                PrescriptionId = prescription.Id,
+                MedicineId = i.MedicineId,
+                MedicineNameRaw = i.MedicineNameRaw,
+                Quantity = i.Quantity
+            });
         }
+
+        prescription.Status = PrescriptionStatus.Ready;
+        await db.SaveChangesAsync(cancellationToken);
 
         return await SearchForConfirmedMedicinesAsync(confirmedWithMedicine, dto.Latitude, dto.Longitude, cancellationToken);
     }
@@ -594,10 +601,10 @@ public class PrescriptionService(
             .Where(i => medicineLookup.ContainsKey(i.MedicineId!.Value))
             .Select(i => medicineLookup[i.MedicineId!.Value].Name);
 
-        return await searchService.SearchForMedicinesAsync(searchTerms, latitude, longitude);
+        return await searchService.SearchForMedicinesAsync(searchTerms, latitude, longitude, cancellationToken);
     }
 
-    private async Task MarkPrescriptionFailedAsync(Guid prescriptionId, CancellationToken cancellationToken)
+    private async Task MarkPrescriptionFailedAsync(Guid prescriptionId)
     {
         try
         {
@@ -605,7 +612,7 @@ public class PrescriptionService(
                 .Where(p => p.Id == prescriptionId)
                 .ExecuteUpdateAsync(
                     s => s.SetProperty(p => p.Status, PrescriptionStatus.Failed),
-                    cancellationToken);
+                    CancellationToken.None);
         }
         catch
         {

@@ -21,10 +21,13 @@ builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("Jwt"))
 builder.Services.Configure<StorageSettings>(builder.Configuration.GetSection("Storage"));
 builder.Services.Configure<CloudinarySettings>(builder.Configuration.GetSection("Cloudinary"));
 builder.Services.Configure<BootstrapAdminSettings>(builder.Configuration.GetSection("BootstrapAdmin"));
+builder.Services.Configure<PrescriptionSettings>(builder.Configuration.GetSection("Prescription"));
 builder.Services.Configure<TesseractSettings>(builder.Configuration.GetSection("Tesseract"));
 
 var jwtSection = builder.Configuration.GetSection("Jwt");
 var secret = jwtSection["Secret"] ?? throw new InvalidOperationException("JWT Secret is missing.");
+if (secret.Length < 32)
+    throw new InvalidOperationException("Jwt:Secret must be at least 32 characters.");
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 if (string.IsNullOrWhiteSpace(connectionString))
@@ -90,6 +93,7 @@ builder.Services.AddScoped<IOcrService, TesseractOcrService>();
 builder.Services.AddScoped<IPrescriptionTextParser, PrescriptionTextParser>();
 builder.Services.AddScoped<IPrescriptionService, PrescriptionService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
+builder.Services.AddHostedService<PrescriptionCleanupService>();
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
     {

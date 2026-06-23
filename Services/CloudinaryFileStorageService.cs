@@ -32,7 +32,7 @@ public class CloudinaryFileStorageService(
             Overwrite = true
         };
 
-        var result = await _cloudinary.UploadAsync(uploadParams);
+        var result = await _cloudinary.UploadAsync(uploadParams, cancellationToken);
         if (result.Error is not null)
             throw ApiException.BadRequest(ApiErrorCodes.PrescriptionImageInvalid,
                 $"Cloudinary upload failed: {result.Error.Message}");

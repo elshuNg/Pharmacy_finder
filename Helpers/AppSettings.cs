@@ -27,6 +27,12 @@ public class TesseractSettings
     public string DataPath { get; set; } = "tessdata";
     public string Language { get; set; } = "eng";
 }
+public class PrescriptionSettings
+{
+    public int ProcessingTimeoutMinutes { get; set; } = 60;
+    public int CleanupIntervalMinutes { get; set; } = 15;
+}
+
 public class CorsSettings
 {
     /// <summary>Comma-separated allowed origins, e.g. http://localhost:4200,http://127.0.0.1:4200</summary>
