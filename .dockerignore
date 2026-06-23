@@ -1,0 +1,10 @@
+bin/
+obj/
+.env
+uploads/
+**/.vs/
+*.user
+*.suo
+.git/
+.gitignore
+**/build-check/
